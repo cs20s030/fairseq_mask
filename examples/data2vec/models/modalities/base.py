@@ -17,7 +17,7 @@ from typing import Optional, Callable
 from fairseq.data.data_utils import compute_mask_indices
 from fairseq.modules import GradMultiply
 from fairseq.utils import index_put
-from examples.data2vec.data.modality import Modality
+from ...data.modality import Modality
 from .modules import D2vDecoderConfig
 
 logger = logging.getLogger(__name__)
@@ -83,7 +83,6 @@ class ModalitySpecificEncoder(nn.Module):
         relative_positional_encoder: Optional[nn.Module],
         context_encoder: nn.Module,
         decoder: nn.Module,
-        decoder_pred: nn.Module,
         get_alibi_bias: Optional[Callable[[int, int, str, str], torch.Tensor]],
     ):
         super().__init__()
@@ -96,7 +95,6 @@ class ModalitySpecificEncoder(nn.Module):
         self.context_encoder = context_encoder
 
         self.decoder = decoder
-        self.decoder_pred = decoder_pred
         self.get_alibi_bias = get_alibi_bias if modality_cfg.use_alibi_encoder else None
 
         self.local_grad_mult = self.modality_cfg.local_grad_mult
@@ -163,8 +161,6 @@ class ModalitySpecificEncoder(nn.Module):
             x = F.dropout(x, inp_drop, training=self.training, inplace=True)
 
         num_extra = self.modality_cfg.num_extra_tokens
-        print('num_extra: ',num_extra)
-        print('x: ', x.shape)
 
         if mask_info is not None:
             num_masked = mask_info.ids_restore.shape[1] - x.shape[1] + num_extra
@@ -225,15 +221,13 @@ class ModalitySpecificEncoder(nn.Module):
             local_features = local_features.clone()
 
         orig_B, orig_T, _ = x.shape
-        print('orig_B ',orig_B)
         pre_mask_B = orig_B
         mask_info = None
 
         x_pos = None
         if self.fixed_positional_encoder is not None:
             x = x + self.fixed_positional_encoder(x, padding_mask)
-        print('x shape: ', x.shape)
-        print('clone_batch: ', clone_batch)
+
         if mask:
             if clone_batch > 1:
                 x = x.repeat_interleave(clone_batch, 0)
@@ -254,7 +248,6 @@ class ModalitySpecificEncoder(nn.Module):
                 if padding_mask is not None:
                     padding_mask = padding_mask.repeat_interleave(clone_batch, 0)
 
-            print('x shape: ', x.shape)
             x, mask_info = self.compute_mask(
                 x,
                 padding_mask,
@@ -345,12 +338,7 @@ class ModalitySpecificEncoder(nn.Module):
         clone_batch: int = 1,
         mask_seeds: Optional[torch.Tensor] = None,
         precomputed_mask=None,
-        only_local_feature=False
     ):
-        if only_local_feature:
-            with torch.no_grad():
-                return self.local_features(features)
-
         x = self.local_features(features)
         return self.contextualized_features(
             x,
@@ -373,9 +361,6 @@ class ModalitySpecificEncoder(nn.Module):
         apply,
         precomputed_mask,
     ):
-        print("Mask Info:")
-        print("precomputed_mask: {}".format(precomputed_mask.shape))
-
         if precomputed_mask is not None:
             mask = precomputed_mask
             mask_info = self.make_maskinfo(x, mask)
@@ -398,7 +383,7 @@ class ModalitySpecificEncoder(nn.Module):
                 else:
                     if self.modality_cfg.inverse_mask:
                         mask_prob = 1 - mask_prob
-                    print("Mask Info: mask_prob = {}".format(mask_prob))    
+
                     mask = compute_mask_indices(
                         (B, T),
                         padding_mask,
@@ -412,8 +397,8 @@ class ModalitySpecificEncoder(nn.Module):
                         epoch=mask_seed.update if mask_seed is not None else None,
                         indices=mask_seed.ids if mask_seed is not None else None,
                     )
+
                     mask = torch.from_numpy(mask).to(device=x.device)
-                    print("Mask Info: mask_size = {}".format(mask.shape))
                     if self.modality_cfg.inverse_mask:
                         mask = 1 - mask
                     mask_info = self.make_maskinfo(x, mask)

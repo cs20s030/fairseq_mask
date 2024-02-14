@@ -21,7 +21,6 @@ task:
   max_sample_size: 320000
   min_sample_size: 32000
   normalize: true
-  precompute_mask_config: {}
 
 dataset:
   num_workers: 6
@@ -32,7 +31,7 @@ dataset:
   disable_validation: true
 
 distributed_training:
-  distributed_world_size: 1
+  distributed_world_size: 4
   ddp_backend: legacy_ddp
 
 criterion:
@@ -46,10 +45,9 @@ criterion:
     - masked_pct
 
 optimization:
-  #max_update: 400000
-  max_epoch: 300
+  max_update: 400000
   lr: [0.00075]
-  debug_param_names: true
+  #max_epoch: 300
 
 optimizer:
   _name: adam

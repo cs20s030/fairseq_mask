@@ -18,7 +18,7 @@ from fairseq.modules import (
 from fairseq.tasks import FairseqTask
 from .base import D2vModalityConfig, ModalitySpecificEncoder, get_alibi_bias
 from .modules import BlockEncoder, Decoder1d
-from examples.data2vec.data.modality import Modality
+from ...data.modality import Modality
 
 
 @dataclass
@@ -125,12 +125,6 @@ class AudioEncoder(ModalitySpecificEncoder):
             else None
         )
 
-        decoder_pred = (
-            Decoder1d(modality_cfg.decoder, embed_dim)
-            if modality_cfg.decoder is not None
-            else None
-        )
-
         alibi_bias_fn = partial(get_alibi_bias, alibi_biases=alibi_biases)
 
         super().__init__(
@@ -142,7 +136,6 @@ class AudioEncoder(ModalitySpecificEncoder):
             relative_positional_encoder=positional_encoder,
             context_encoder=context_encoder,
             decoder=decoder,
-            decoder_pred=decoder_pred,
             get_alibi_bias=alibi_bias_fn,
         )
 
@@ -197,6 +190,3 @@ class AudioEncoder(ModalitySpecificEncoder):
                 mod.reset_parameters()
         if self.decoder is not None:
             self.decoder.reset_parameters()
-
-        if self.decoder_pred is not None:
-            self.decoder_pred.reset_parameters()   
