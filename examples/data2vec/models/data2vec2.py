@@ -22,29 +22,29 @@ from fairseq.modules import EMAModule, EMAModuleConfig
 from fairseq.dataclass import FairseqDataclass
 from fairseq.models import BaseFairseqModel, register_model
 
-from ..data.modality import Modality
+from examples.data2vec.data.modality import Modality
 
-from ..models.modalities.base import (
+from examples.data2vec.models.modalities.base import (
     MaskSeed,
     D2vModalityConfig,
     ModalitySpecificEncoder,
     get_annealed_rate,
 )
-from ..models.modalities.modules import (
+from examples.data2vec.models.modalities.modules import (
     D2vDecoderConfig,
     AltBlock,
     Decoder1d,
 )
 
-from ..models.modalities.audio import (
+from examples.data2vec.models.modalities.audio import (
     D2vAudioConfig,
     AudioEncoder,
 )
-from ..models.modalities.images import (
+from examples.data2vec.models.modalities.images import (
     D2vImageConfig,
     ImageEncoder,
 )
-from ..models.modalities.text import (
+from examples.data2vec.models.modalities.text import (
     D2vTextConfig,
     TextEncoder,
 )
@@ -126,10 +126,10 @@ class Data2VecMultiConfig(FairseqDataclass):
     shared_decoder: Optional[D2vDecoderConfig] = None
 
     min_target_var: float = field(
-        default=0.00001, metadata={"help": "stop training if target var falls below this"}
+        default=0.1, metadata={"help": "stop training if target var falls below this"}
     )
     min_pred_var: float = field(
-        default=0.00001,
+        default=0.01,
         metadata={"help": "stop training if prediction var falls below this"},
     )
 
@@ -143,6 +143,7 @@ class Data2VecMultiConfig(FairseqDataclass):
     cls_loss: float = 0
     recon_loss: float = 0
     d2v_loss: float = 1
+    learning_loss: float =1
 
     decoder_group: bool = False
 
@@ -189,6 +190,7 @@ class Data2VecMultiModel(BaseFairseqModel):
         make_layer_norm = partial(
             nn.LayerNorm, eps=cfg.norm_eps, elementwise_affine=cfg.norm_affine
         )
+
 
         def make_block(drop_path, dim=None, heads=None):
             return AltBlock(
@@ -390,7 +392,153 @@ class Data2VecMultiModel(BaseFairseqModel):
         else:
             modalities = task.supported_modalities
         return cls(cfg, modalities, task=task, skip_ema=cfg.skip_ema)
+    
+    
+    @torch.no_grad()
+    def generate_mask(self, loss_pred, mask_ratio=0.75, guide=True, epoch=0, total_epoch=300):
+        N, L = loss_pred.shape
 
+        len_keep = int(L * (1 - mask_ratio))
+        
+        ids_shuffle_loss = torch.argsort(loss_pred, dim=1)# (N, L)
+
+        # keep `keep_ratio` loss and `1 - keep_ratio` random
+        keep_ratio = 0.7
+        ids_shuffle = torch.zeros_like(ids_shuffle_loss, device=loss_pred.device).int()
+        
+        if guide:
+            keep_ratio = float((epoch + 1) / total_epoch) * 0.7
+        
+        ## top 0 -> 0.5
+        if int((L - len_keep) * keep_ratio) <= 0:
+            # random
+            noise = torch.randn(N, L, device=loss_pred.device)
+            ids_shuffle = torch.argsort(noise, dim=1)
+
+        else:
+            for i in range(N):
+                ## mask top `keep_ratio` loss and `1 - keep_ratio` random
+                len_loss = int((L - len_keep) * keep_ratio)
+                ids_shuffle[i, -len_loss:] = ids_shuffle_loss[i, -len_loss:]
+
+                temp = torch.arange(L, device=loss_pred.device)
+                deleted = np.delete(temp.cpu().numpy(), ids_shuffle[i, -len_loss:].cpu().numpy())
+                np.random.shuffle(deleted)
+                ids_shuffle[i, :(L - len_loss)] = torch.LongTensor(deleted).to(loss_pred.device)
+
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+        # generate mask: 0 is keep, 1 is remove
+        mask = torch.ones([N, L], device=loss_pred.device)
+        mask[:, :len_keep] = 0
+        # unshuffle to get final mask
+        mask = torch.gather(mask, dim=1, index=ids_restore)
+
+        return mask
+    
+    @torch.no_grad()
+    def forward_teacher(self, feature_extractor, mode, target, source, padding_mask, local_features, alibi_scale=None):
+        p = next(self.ema.model.parameters())
+        device = local_features.device
+        dtype = local_features.dtype
+        ema_device = p.device
+        ema_dtype = p.dtype
+
+        if not self.cfg.ema_same_dtype:
+            dtype = ema_dtype
+
+        if ema_device != device or ema_dtype != dtype:
+            logger.info(f"adjusting ema dtype to {dtype} and device to {device}")
+            self.ema.model = self.ema.model.to(dtype=dtype, device=device)
+            ema_dtype = dtype
+
+            def to_device(d):
+                for k, p in d.items():
+                    if isinstance(d[k], dict):
+                        to_device(d[k])
+                    else:
+                        d[k] = p.to(device=device)
+
+            to_device(self.ema.fp32_params)
+        tm = self.ema.model
+        
+        with torch.no_grad():
+            tm.eval()
+
+            if self.cfg.ema_encoder_only:
+                assert target is None
+                ema_input = local_features
+                ema_input = feature_extractor.contextualized_features(
+                    ema_input.to(dtype=ema_dtype),
+                    padding_mask,
+                    mask=False,
+                    remove_masked=False,
+                )
+                ema_blocks = tm
+            else:
+                ema_blocks = tm.blocks
+                if feature_extractor.modality_cfg.ema_local_encoder:
+                    inp = (
+                        target.to(dtype=ema_dtype)
+                        if target is not None
+                        else source.to(dtype=ema_dtype)
+                    )
+                    ema_input = tm.modality_encoders[mode](
+                        inp,
+                        padding_mask,
+                        mask=False,
+                        remove_masked=False,
+                    )
+                else:
+                    assert target is None
+                    ema_input = local_features
+                    ema_feature_enc = tm.modality_encoders[mode]
+                    ema_input = ema_feature_enc.contextualized_features(
+                        ema_input.to(dtype=ema_dtype),
+                        padding_mask,
+                        mask=False,
+                        remove_masked=False,
+                    )
+
+            ema_padding_mask = ema_input["padding_mask"]
+            ema_alibi_bias = ema_input.get("alibi_bias", None)
+            ema_alibi_scale = ema_input.get("alibi_scale", None)
+            ema_input = ema_input["x"]
+
+            y = []
+            ema_x = []
+            extra_tokens = feature_extractor.modality_cfg.num_extra_tokens
+            for i, blk in enumerate(ema_blocks):
+                ab = ema_alibi_bias
+                if ab is not None and alibi_scale is not None:
+                    scale = (
+                        ema_alibi_scale[i]
+                        if ema_alibi_scale.size(0) > 1
+                        else ema_alibi_scale.squeeze(0)
+                    )
+                    ab = ab * scale.type_as(ab)
+
+                ema_input, lr = blk(
+                    ema_input,
+                    padding_mask=ema_padding_mask,
+                    alibi_bias=ab,
+                )
+                y.append(lr[:, extra_tokens:])
+                ema_x.append(ema_input[:, extra_tokens:])
+
+        y = self.make_targets(y, self.average_top_k_layers)
+        print('y: ', y.shape)
+        print(tm.modality_encoders[mode].decoder_pred)
+        if (tm.modality_encoders[mode].decoder_pred):
+            with torch.no_grad():
+                loss_pred = self.forward_decoder(y.to(torch.float16), 
+                                                 tm.modality_encoders[mode], 
+                                                 tm.modality_encoders[mode].decoder_pred, 
+                                                 mask_info=None, 
+                                                 model_type='teacher').mean(dim=-1)
+        return loss_pred
+
+    
     def forward(
         self,
         source,
@@ -403,6 +551,7 @@ class Data2VecMultiModel(BaseFairseqModel):
         force_remove_masked=False,
         remove_extra_tokens=True,
         precomputed_mask=None,
+        epoch=None
     ):
         if mode is None:
             assert self.cfg.supported_modality is not None
@@ -410,13 +559,45 @@ class Data2VecMultiModel(BaseFairseqModel):
 
         if isinstance(mode, Modality):
             mode = mode.name
-
         feature_extractor = self.modality_encoders[mode]
 
         mask_seeds = None
         if id is not None:
             mask_seeds = MaskSeed(seed=self.cfg.seed, update=self.num_updates, ids=id)
+        print('self.num_updates: ', self.num_updates)
+        print('epoch: ', epoch)  
+        print('device for source: ', source.device)
+        print('padding_mask: ', padding_mask)
+        print('precomputed_mask previous: ', precomputed_mask.shape)
+        print("Stage 1: feature_extractor------------------------------------------------------")
+        print("source shape ", source.shape)
+        
+        local_feature = feature_extractor(
+            source,
+            padding_mask,
+            mask,
+            remove_masked=not features_only or force_remove_masked,
+            clone_batch=self.cfg.clone_batch if not features_only else 1,
+            mask_seeds=mask_seeds,
+            precomputed_mask=precomputed_mask,
+            only_local_feature=True,
+        )
 
+        print("Stage 1: loss_pred and mask generation------------------------------------------------------")
+
+        loss_pred = self.forward_teacher(feature_extractor, 
+                             mode, 
+                             target, 
+                             source, 
+                             padding_mask, 
+                             local_feature, 
+                             None)
+
+
+        precomputed_mask = self.generate_mask(loss_pred=loss_pred, epoch=epoch-1)              
+
+        print("precomputed_mask_after ", precomputed_mask.shape)
+        
         extractor_out = feature_extractor(
             source,
             padding_mask,
@@ -426,12 +607,21 @@ class Data2VecMultiModel(BaseFairseqModel):
             mask_seeds=mask_seeds,
             precomputed_mask=precomputed_mask,
         )
-
+        print("Stage 2: feature_extractor done ------------------------------------------------------")
         x = extractor_out["x"]
+
+        print('extractor_out[local_feature] ', extractor_out["local_features"].shape)
+
         encoder_mask = extractor_out["encoder_mask"]
         masked_padding_mask = extractor_out["padding_mask"]
+        print('masked_padding_mask: ', masked_padding_mask)
+        
         masked_alibi_bias = extractor_out.get("alibi_bias", None)
+        print('masked_alibi_bias', masked_alibi_bias)
         alibi_scale = extractor_out.get("alibi_scale", None)
+        print('alibi_scale', alibi_scale)
+        
+        
 
         if self.dropout_input is not None:
             x = self.dropout_input(x)
@@ -479,7 +669,9 @@ class Data2VecMultiModel(BaseFairseqModel):
             }
 
         xs = []
-
+        print("Stage 3: decoding start ------------------------------------------------------")
+        print("self.shared_decoder : {}".format(self.shared_decoder))
+        print("feature_extractor.decoder : {}".format(feature_extractor.decoder))
         if self.shared_decoder is not None:
             dx = self.forward_decoder(
                 x,
@@ -497,6 +689,19 @@ class Data2VecMultiModel(BaseFairseqModel):
             )
             xs.append(dx)
             orig_x = x
+        
+        #Get the embedding from the decoder_pred as well
+        if feature_extractor.decoder_pred is not None:
+
+            x_loss_pred = self.forward_decoder(
+                x,
+                feature_extractor,
+                feature_extractor.decoder_pred,
+                encoder_mask,
+            )
+            x_loss_pred = x_loss_pred.mean(dim=-1)
+        print('input x shape: {}'.format(x.shape))
+        print('x_loss_pred shape: {}'.format(x_loss_pred.shape))
 
         assert len(xs) > 0
 
@@ -524,6 +729,9 @@ class Data2VecMultiModel(BaseFairseqModel):
             to_device(self.ema.fp32_params)
         tm = self.ema.model
 
+        print('tm------------')
+        print(tm)
+        
         with torch.no_grad():
             tm.eval()
 
@@ -596,13 +804,19 @@ class Data2VecMultiModel(BaseFairseqModel):
 
         masked = encoder_mask.mask.unsqueeze(-1)
         masked_b = encoder_mask.mask.bool()
+        print('y shape {}, masked_b shape {}'.format(y.shape, masked_b.shape))
         y = y[masked_b]
 
+        #resize the batch as N X D
         if xs[0].size(1) == masked_b.size(1):
             xs = [x[masked_b] for x in xs]
+            x_loss_pred = x_loss_pred[masked_b]
+            print("In IF")
         else:
             xs = [x.reshape(-1, x.size(-1)) for x in xs]
-
+            x_loss_pred = x_loss_pred.reshape(-1, x.size(-1))
+            print("In Else")
+        print('shape of xs[0]: {} and x_loss_pred: {}'.format(xs[0].shape, x_loss_pred.shape))
         sample_size = masked.sum().long()
 
         result = {
@@ -611,7 +825,12 @@ class Data2VecMultiModel(BaseFairseqModel):
         }
 
         sample_size = result["sample_size"]
-
+        print('Stage 4: Loss computation-------------------------------------------------------')
+        print('sample_size: {}'.format(result["sample_size"]))
+        print('self.cfg.cls_loss {}'.format(self.cfg.cls_loss))
+        print('self.cfg.recon_loss {}'.format(self.cfg.recon_loss))
+        print('self.cfg.d2v_loss {}'.format(self.cfg.d2v_loss))
+        
         if self.cfg.cls_loss > 0:
             assert extra_tokens > 0
             cls_target = orig_targets.mean(dim=1)
@@ -643,13 +862,26 @@ class Data2VecMultiModel(BaseFairseqModel):
             result["losses"]["recon"] = (
                 self.d2v_loss(recon, target.float()) * self.cfg.recon_loss
             )
-
+        #detach the matrix version of the loss
+        target_reg_loss = 0
         if self.cfg.d2v_loss > 0:
+            
             for i, x in enumerate(xs):
                 reg_loss = self.d2v_loss(x, y)
+                target_reg_loss = reg_loss['matrix'].detach()
+                print('target_reg_loss shape: {}'.format(target_reg_loss.shape))
                 n = f"{mode}_regression_{i}" if len(xs) > 1 else f"{mode}_regression"
-                result["losses"][n] = reg_loss * self.cfg.d2v_loss
-
+                print('n: {}'.format(n))
+                result["losses"][n] = reg_loss['mean'] * self.cfg.d2v_loss
+                
+                #compute the dense relation loss for predicting the recognition loss
+                
+                if self.cfg.learning_loss > 0:
+                    learning_loss = self.forward_learning_loss(x_loss_pred, mask, target_reg_loss, True)
+                    print("target_reg_loss matrix shape: {}".format(target_reg_loss.shape))
+                    result["losses"][n]+=learning_loss
+                    result["learning_loss"] = learning_loss
+                
         suffix = "" if len(self.modalities) == 1 else f"_{mode}"
         with torch.no_grad():
             if encoder_mask is not None:
@@ -694,18 +926,65 @@ class Data2VecMultiModel(BaseFairseqModel):
         feature_extractor,
         decoder,
         mask_info,
+        model_type='student'
     ):
+        if model_type=='teacher':
+            print('x ', x.shape)
+            x = decoder(x,mask_info)
+            return x
+        
         x = feature_extractor.decoder_input(x, mask_info)
         x = decoder(*x)
 
         return x
 
+    def forward_learning_loss(self, loss_pred, mask, loss_target, relative=True):
+        """
+        loss_pred: [N, L, 1]
+        mask: [N, L], 0 is keep, 1 is remove,
+        loss_target: [N, L]
+        """
+        # N, L = loss_target.shape
+        # loss_pred = loss_pred[mask].reshape(N, L)
+        print('loss_pred shape: {}'.format(loss_pred.shape))
+        print('loss_target shape: {}'.format(loss_target.shape))
+
+        if relative:
+            # binary classification for LxL
+            
+            labels_positive = loss_target.unsqueeze(0) > loss_target.unsqueeze(1)
+            labels_negative = loss_target.unsqueeze(0) < loss_target.unsqueeze(1)
+            print('labels_positive shape: {}'.format(labels_positive.shape))
+            print('labels_negative shape: {}'.format(labels_negative.shape))
+            
+            labels_valid = labels_positive + labels_negative
+            
+            loss_matrix = loss_pred.unsqueeze(0) - loss_pred.unsqueeze(1)
+            loss_pos = - labels_positive.int() * torch.log(torch.sigmoid(loss_matrix) + 1e-6)
+            loss_neg = - labels_negative.int() * torch.log(1 - torch.sigmoid(loss_matrix) + 1e-6)
+            
+            loss = loss_pos+loss_neg
+
+            return loss.sum() / labels_valid.sum()
+
+        else:
+            # normalize by each image
+            mean = loss_target.mean(dim=1, keepdim=True)
+            var = loss_target.var(dim=1, keepdim=True)
+            loss_target = (loss_target - mean) / (var + 1.e-6) ** .5  # [N, L, 1]
+
+            loss = (loss_pred - loss_target) ** 2
+            loss = loss.mean()
+            return loss
+    
+    
     def d2v_loss(self, x, y):
         x = x.view(-1, x.size(-1)).float()
         y = y.view(-1, x.size(-1))
-
+        #add changes for matrix and mean types
         if self.loss_beta == 0:
             loss = F.mse_loss(x, y, reduction="none")
+            loss_matrix = ((x - y) ** 2).sum(dim=-1)
         else:
             loss = F.smooth_l1_loss(x, y, reduction="none", beta=self.loss_beta)
 
@@ -715,8 +994,10 @@ class Data2VecMultiModel(BaseFairseqModel):
             scale = 1 / math.sqrt(x.size(-1))
 
         reg_loss = loss * scale
-
-        return reg_loss
+        reg_loss_matrix = loss_matrix * scale
+        reg_loss_final = dict(zip(['mean', 'matrix'],
+                                  [reg_loss, reg_loss_matrix]))    
+        return reg_loss_final 
 
     def make_targets(self, y, num_layers):
 
