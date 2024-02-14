@@ -19,7 +19,11 @@ from torchvision import transforms
 from fairseq.dataclass import FairseqDataclass
 from fairseq.tasks import FairseqTask, register_task
 
-from ..data import ImageDataset
+try:
+    from ..data import ImageDataset
+except:
+    sys.path.append("..")
+    from data import ImageDataset
 
 logger = logging.getLogger(__name__)
 
